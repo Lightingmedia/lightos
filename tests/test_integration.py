@@ -623,26 +623,37 @@ class TestSkyOrchestratorIntegration(unittest.TestCase):
 class TestRemoteExecutorContract(unittest.TestCase):
     """The SSH executor's wiring, with paramiko itself mocked out."""
 
-    def test_payload_is_wrapped_with_workdir_and_env(self) -> None:
+    @staticmethod
+    def _mock_channel(chunks: List[bytes] = None):
+        """A channel that yields `chunks` then reports a clean exit."""
+        pending = list(chunks or [])
+        channel = MagicMock()
+        channel.recv_ready.side_effect = lambda: bool(pending)
+        channel.recv.side_effect = lambda n: pending.pop(0)
+        channel.recv_stderr_ready.return_value = False
+        channel.exit_status_ready.side_effect = lambda: not pending
+        channel.recv_exit_status.return_value = 0
+        return channel
+
+    def _run(self, channel, **executor_kwargs):
         from lightos.execution import RemoteJobExecutor
 
         sink = io.StringIO()
-        executor = RemoteJobExecutor(host_ip="203.0.113.10", stdout=sink)
-        channel = MagicMock()
-        channel.recv_ready.return_value = False
-        channel.recv_stderr_ready.return_value = False
-        channel.exit_status_ready.return_value = True
-        channel.recv_exit_status.return_value = 0
+        executor = RemoteJobExecutor(host_ip="203.0.113.10", stdout=sink,
+                                     **executor_kwargs)
         transport = MagicMock()
         transport.open_session.return_value = channel
         client = MagicMock()
         client.get_transport.return_value = transport
-
         with patch.object(RemoteJobExecutor, "ssh_client", client):
             exit_code = executor.execute_and_stream_logs(
                 "python3 train.py", run_directory="/tmp/lightos_workdir",
                 env={"TOKEN": "abc"})
+        return exit_code, channel, sink.getvalue()
 
+    def test_payload_is_wrapped_with_workdir_and_env(self) -> None:
+        exit_code, channel, _ = self._run(self._mock_channel(),
+                                          use_select=False)
         self.assertEqual(exit_code, 0)
         channel.get_pty.assert_called_once()
         command = channel.exec_command.call_args[0][0]
@@ -650,6 +661,43 @@ class TestRemoteExecutorContract(unittest.TestCase):
         self.assertIn("export TOKEN='abc'", command)
         self.assertIn("python3 train.py", command)
         self.assertIn("pipefail", command)
+
+    def test_output_is_streamed_on_the_polling_path(self) -> None:
+        """The path taken on Windows, where select() rejects non-sockets."""
+        channel = self._mock_channel([b"epoch 1\n", b"epoch 2\n"])
+        exit_code, _, output = self._run(channel, use_select=False)
+        self.assertEqual(exit_code, 0)
+        self.assertIn("epoch 1", output)
+        self.assertIn("epoch 2", output)
+
+    def test_output_is_streamed_on_the_select_path(self) -> None:
+        """The path taken on POSIX, which the Linux CI runners exercise."""
+        channel = self._mock_channel([b"epoch 1\n", b"epoch 2\n"])
+        # Stand in for the real socket select() would need.
+        with patch("select.select", return_value=([channel], [], [])):
+            exit_code, _, output = self._run(channel, use_select=True)
+        self.assertEqual(exit_code, 0)
+        self.assertIn("epoch 1", output)
+        self.assertIn("epoch 2", output)
+
+    def test_select_is_used_only_on_posix(self) -> None:
+        """Guards against the branch being chosen by accident."""
+        from lightos.execution import RemoteJobExecutor
+
+        with patch.object(os, "name", "posix"):
+            self.assertTrue(RemoteJobExecutor(host_ip="h").use_select)
+        with patch.object(os, "name", "nt"):
+            self.assertFalse(RemoteJobExecutor(host_ip="h").use_select)
+
+    def test_stderr_is_streamed_too(self) -> None:
+        channel = self._mock_channel()
+        errors = [b"traceback\n"]
+        channel.recv_stderr_ready.side_effect = lambda: bool(errors)
+        channel.recv_stderr.side_effect = lambda n: errors.pop(0)
+        channel.exit_status_ready.side_effect = lambda: not errors
+        exit_code, _, output = self._run(channel, use_select=False)
+        self.assertEqual(exit_code, 0)
+        self.assertIn("traceback", output)
 
     def test_missing_ssh_key_is_reported_clearly(self) -> None:
         from lightos.execution import ExecutionError, RemoteJobExecutor

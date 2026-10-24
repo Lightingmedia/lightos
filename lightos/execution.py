@@ -85,7 +85,13 @@ class RemoteJobExecutor:
                  connect_timeout: int = 15,
                  connect_retries: int = 10,
                  excludes: Sequence[str] = DEFAULT_EXCLUDES,
-                 stdout: Optional[IO[str]] = None):
+                 stdout: Optional[IO[str]] = None,
+                 use_select: Optional[bool] = None):
+        # `select` only accepts real sockets on Windows, where a paramiko
+        # Channel is not one, so poll there instead. Explicit rather than
+        # decided inline so both paths are testable on any platform.
+        self.use_select = (os.name == "posix") if use_select is None \
+            else use_select
         self.host_ip = host_ip
         self.username = username
         self.ssh_key_path = os.path.expanduser(ssh_key_path)
@@ -269,12 +275,8 @@ class RemoteJobExecutor:
         return exit_code
 
     def _pump_channel(self, channel) -> None:
-        """Drain the channel to our stdout until the command exits.
-
-        `select` only accepts real sockets on Windows, so we select where it
-        works and fall back to a short polling loop where it does not.
-        """
-        use_select = os.name == "posix"
+        """Drain the channel to our stdout until the command exits."""
+        use_select = self.use_select
         if use_select:
             import select
 
