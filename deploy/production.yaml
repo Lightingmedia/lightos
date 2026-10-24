@@ -1,0 +1,80 @@
+# Production blueprint: LightOS deploying itself to agentic.lightos.sh.
+#
+#   python main.py deploy/production.yaml --dry-run   # price it first
+#   python main.py deploy/production.yaml             # provision and deploy
+#
+# The orchestrator provisions a CPU node, syncs this repo to it, installs
+# Docker, and brings up the API behind Caddy, which obtains the TLS
+# certificate for the domain on first request.
+#
+# Prerequisites (see README "Deploying to production"):
+#   * AWS credentials + LIGHTOS_AWS_AMI + LIGHTOS_AWS_KEY_NAME
+#   * a security group allowing inbound 80/443 (ACME needs both) and 22
+#   * an A/AAAA record for agentic.lightos.sh pointing at the node's address
+#   * LIGHTOS_ACME_EMAIL exported for certificate registration
+name: lightos-production
+
+# Sync the whole repository; the compose build needs lightos/ and deploy/.
+workdir: ..
+
+resources:
+  # The API is I/O bound: no accelerator, cheapest CPU node available.
+  accelerators: null
+  gpu_count: 0
+  cloud: aws
+  region: us-east-1
+
+remote_workdir: /opt/lightos
+
+envs:
+  LIGHTOS_DOMAIN: agentic.lightos.sh
+  # Read from the launching shell; never commit these values.
+  LIGHTOS_ACME_EMAIL: ${LIGHTOS_ACME_EMAIL}
+  LIGHTOS_API_TOKEN: ${LIGHTOS_API_TOKEN}
+
+setup: |
+  echo "[deploy] Installing Docker Engine and the compose plugin..."
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq ca-certificates curl gnupg
+  sudo install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+    | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  sudo systemctl enable --now docker
+  echo "[deploy] Docker ready: $(sudo docker --version)"
+
+run: |
+  set -euo pipefail
+  echo "[deploy] Bringing up the LightOS stack for ${LIGHTOS_DOMAIN}..."
+  cd /opt/lightos
+  sudo -E docker compose -f deploy/docker-compose.yml up -d --build
+
+  echo "[deploy] Waiting for the API to report healthy..."
+  for attempt in $(seq 1 30); do
+    if sudo docker compose -f deploy/docker-compose.yml exec -T lightos \
+         python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)" 2>/dev/null; then
+      echo "[deploy] API is healthy."
+      break
+    fi
+    if [ "$attempt" -eq 30 ]; then
+      echo "[deploy] API never became healthy; dumping logs." >&2
+      sudo docker compose -f deploy/docker-compose.yml logs --tail 100 >&2
+      exit 1
+    fi
+    sleep 5
+  done
+
+  echo "[deploy] Verifying TLS for ${LIGHTOS_DOMAIN}..."
+  # Caddy issues the certificate on the first request to the public name.
+  curl -fsS --retry 10 --retry-delay 6 --retry-connrefused \
+    "https://${LIGHTOS_DOMAIN}/healthz" && echo
+  echo "[deploy] https://${LIGHTOS_DOMAIN} is live."
+
+# The production host must outlive the deploy job.
+autostop: false

@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor matches requires-python in pyproject.toml.
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyflakes
+
+      - name: Lint (unused imports, undefined names)
+        run: python -m pyflakes lightos main.py tests
+
+      - name: Run test suite
+        # -W error::ResourceWarning catches sockets and files the suite leaks.
+        run: python -W error::ResourceWarning -m unittest discover tests -v
+
+      - name: Verify the CLI runs without provisioning
+        run: |
+          python main.py validate task_config.yaml
+          python main.py catalog -a A100 -n 8
+          python main.py --dry-run
+
+  docker:
+    name: Image build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          tags: lightos:ci
+          load: true          # into the local daemon so we can run it
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start the container
+        run: docker run -d --name lightos-ci -p 8080:8080 lightos:ci
+
+      - name: Wait for the container to report healthy
+        run: |
+          for attempt in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' lightos-ci)
+            if [ "$status" = "healthy" ]; then
+              echo "Container healthy after ${attempt} attempt(s)."
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              echo "::error::Container reported unhealthy." && break
+            fi
+            sleep 2
+          done
+          echo "::error::Container never became healthy."
+          docker logs lightos-ci
+          exit 1
+
+      - name: Smoke-test the API
+        run: |
+          set -euo pipefail
+
+          echo "--- GET /healthz ---"
+          curl -fsS http://127.0.0.1:8080/healthz | tee /tmp/health.json
+          grep -q '"status": "ok"' /tmp/health.json
+
+          echo "--- GET /v1/catalog ---"
+          curl -fsS "http://127.0.0.1:8080/v1/catalog?accelerator=A10G" \
+            | tee /tmp/catalog.json
+          grep -q 'g5.xlarge' /tmp/catalog.json
+
+          echo "--- POST /v1/estimate ---"
+          curl -fsS -X POST --data-binary @task_config.yaml \
+            http://127.0.0.1:8080/v1/estimate | tee /tmp/estimate.json
+          grep -q '"provisioned": false' /tmp/estimate.json
+
+          echo "--- POST /v1/jobs must be refused without a token ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            --data-binary @task_config.yaml http://127.0.0.1:8080/v1/jobs)
+          if [ "$code" != "403" ]; then
+            echo "::error::Expected 403 from /v1/jobs, got ${code}."
+            exit 1
+          fi
+          echo "Job submission correctly refused (403)."
+
+      - name: Verify the container does not run as root
+        run: |
+          uid=$(docker exec lightos-ci id -u)
+          if [ "$uid" = "0" ]; then
+            echo "::error::Container is running as root."
+            exit 1
+          fi
+          echo "Running unprivileged as uid ${uid}."
+
+      - name: Container logs
+        if: always()
+        run: docker logs lightos-ci || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f lightos-ci || true
+
+  deploy-config:
+    name: Deployment config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Validate the compose stack
+        env:
+          LIGHTOS_ACME_EMAIL: ci@example.com
+          LIGHTOS_DOMAIN: agentic.lightos.sh
+        run: docker compose -f deploy/docker-compose.yml config --quiet
+
+      - name: Validate the Caddy TLS config
+        run: |
+          docker run --rm \
+            -e LIGHTOS_DOMAIN=agentic.lightos.sh \
+            -e LIGHTOS_ACME_EMAIL=ci@example.com \
+            -v "${PWD}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile
+
+      - name: Check the Caddyfile is formatted
+        run: |
+          docker run --rm -v "${PWD}/deploy:/work" -w /work \
+            caddy:2.8-alpine caddy fmt Caddyfile > /tmp/formatted
+          if ! diff -u deploy/Caddyfile /tmp/formatted; then
+            echo "::error::Caddyfile is not formatted; run 'caddy fmt --overwrite deploy/Caddyfile'."
+            exit 1
+          fi
+
+      - name: Validate the production blueprint
+        env:
+          LIGHTOS_ACME_EMAIL: ci@example.com
+          LIGHTOS_API_TOKEN: ci-placeholder-token
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python main.py validate deploy/production.yaml

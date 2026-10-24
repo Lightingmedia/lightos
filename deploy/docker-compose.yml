@@ -1,0 +1,54 @@
+# Production stack for agentic.lightos.sh.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Caddy terminates TLS and obtains certificates from Let's Encrypt on first
+# request, so nothing here holds a certificate or a private key.
+services:
+  lightos:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: lightos:latest
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      # Leave unset to keep the deployment read-only. Set it (see deploy.sh)
+      # to enable POST /v1/jobs, which runs caller-supplied shell.
+      LIGHTOS_API_TOKEN: ${LIGHTOS_API_TOKEN:-}
+      LIGHTOS_CATALOG: ${LIGHTOS_CATALOG:-}
+    # Not published to the host: only Caddy reaches it, over the internal net.
+    expose:
+      - "8080"
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates live here; keep this volume
+      - caddy_config:/config
+    environment:
+      LIGHTOS_DOMAIN: ${LIGHTOS_DOMAIN:-agentic.lightos.sh}
+      LIGHTOS_ACME_EMAIL: ${LIGHTOS_ACME_EMAIL:?set LIGHTOS_ACME_EMAIL}
+    depends_on:
+      - lightos
+    networks:
+      - edge
+
+networks:
+  edge:
+
+volumes:
+  caddy_data:
+  caddy_config:

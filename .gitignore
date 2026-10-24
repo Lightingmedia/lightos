@@ -1,0 +1,42 @@
+# Upstream SkyPilot snapshot kept locally as a reference. Not part of this
+# project: it is a separate Apache-2.0 codebase with its own history, so it
+# is read here rather than vendored into this repository.
+skypilot-master/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and credentials. Blueprints reference secrets by name
+# (`HF_TOKEN: ${HF_TOKEN}`); values stay out of the repository.
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_rsa.*
+
+# Generated pricing snapshots (see CostCatalog.to_json)
+catalog*.json
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

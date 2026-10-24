@@ -1,0 +1,33 @@
+[build-system]
+# >=77 for PEP 639 license expressions (`license = "Apache-2.0"`).
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightos"
+version = "0.1.0"
+description = "Cost-optimized multi-cloud job orchestrator"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "PyYAML>=6.0",
+    "paramiko>=3.4",
+]
+
+[project.optional-dependencies]
+aws = ["boto3>=1.34"]
+gcp = ["google-cloud-compute>=1.19"]
+k8s = ["kubernetes>=29.0"]
+all = [
+    "boto3>=1.34",
+    "google-cloud-compute>=1.19",
+    "kubernetes>=29.0",
+]
+
+[project.scripts]
+lightos = "lightos.cli:main"
+
+[tool.setuptools]
+packages = ["lightos", "lightos.backends"]

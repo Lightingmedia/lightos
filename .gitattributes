@@ -1,0 +1,22 @@
+# Normalize to LF in the repository and on checkout.
+#
+# These files are consumed by bash, Docker and Caddy inside Linux containers.
+# A CRLF checkout on Windows leaves a trailing \r on every line, which breaks
+# shell payloads and the Caddyfile parser, so pin the line ending rather than
+# leaving it to each clone's core.autocrlf setting.
+* text=auto eol=lf
+
+*.py       text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.toml     text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+*.sh       text eol=lf
+Dockerfile text eol=lf
+Caddyfile  text eol=lf
+
+# Keep binaries untouched.
+*.png binary
+*.jpg binary
+*.gz  binary

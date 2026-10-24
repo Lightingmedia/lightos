@@ -1,0 +1,41 @@
+# TLS for agentic.lightos.sh. Caddy requests and renews the certificate
+# automatically over ACME; no key material is stored in this repo.
+{
+	email {$LIGHTOS_ACME_EMAIL}
+}
+
+{$LIGHTOS_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Job submission executes caller-supplied shell on provisioned hardware.
+	# Keep it off the public listener unless you intend to expose it; the API
+	# also refuses it unless LIGHTOS_API_TOKEN is set.
+	#
+	# Both branches are `handle` blocks: they are mutually exclusive and
+	# evaluated in written order, whereas a bare directive alongside them
+	# would be ordered independently and could bypass this block.
+	@jobs path /v1/jobs /v1/jobs/*
+	handle @jobs {
+		respond "Job submission is not exposed publicly." 403
+	}
+
+	handle {
+		reverse_proxy lightos:8080 {
+			health_uri /healthz
+			health_interval 30s
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

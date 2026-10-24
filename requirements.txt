@@ -1,0 +1,13 @@
+# Core runtime.
+PyYAML>=6.0
+
+# Remote execution over SSH.
+paramiko>=3.4
+
+# Cloud backends. Install only what you provision against:
+#   AWS  -> boto3
+#   GCP  -> google-cloud-compute
+#   K8s  -> kubernetes
+boto3>=1.34
+# google-cloud-compute>=1.19
+# kubernetes>=29.0

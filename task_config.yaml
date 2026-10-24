@@ -1,0 +1,29 @@
+# LightOS task blueprint.
+#
+#   python main.py --dry-run        # see which cluster this would pick
+#   python main.py                  # provision, sync, run, tear down
+name: deep-learning-integration-test
+
+# Local directory synced to the node. Relative paths resolve against this file.
+workdir: .
+
+resources:
+  accelerators: A10G
+  gpu_count: 1
+  # cloud: aws          # uncomment to pin a cloud
+  # region: us-east-1   # uncomment to pin a region
+
+# Exported before setup and run. Keep secrets out of version control; read
+# them from the environment instead, e.g. HF_TOKEN: ${HF_TOKEN}
+envs:
+  LIGHTOS_RUN_MODE: integration
+
+setup: |
+  echo "Initializing dependencies..."
+  python3 -m pip install --quiet --upgrade pip
+
+run: |
+  python3 -c "print('Integration verification successful!')"
+
+# Terminate the cluster as soon as the payload exits.
+autostop: true
