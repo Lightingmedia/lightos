@@ -11,6 +11,7 @@ import io
 import json
 import os
 import tempfile
+from datetime import date
 import unittest
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
@@ -18,7 +19,8 @@ from unittest.mock import MagicMock, patch
 import yaml
 
 from lightos.backends.base import CloudProvider, ProvisionedNode
-from lightos.catalog import CatalogError, CostCatalog, estimate_cost
+from lightos.catalog import (CatalogError, CostCatalog, describe_request,
+                             estimate_cost, total_vram_gb, vram_for_model)
 from lightos.execution import DEFAULT_EXCLUDES, _is_excluded
 from lightos.orchestrator import Orchestrator
 from lightos.task import Task, TaskError
@@ -132,8 +134,14 @@ class TestCostCatalog(unittest.TestCase):
     def test_honours_minimum_gpu_count(self) -> None:
         offer = self.catalog.find_cheapest_match("A100", 8)
         self.assertGreaterEqual(offer["gpus"], 8)
-        # The 1-GPU k8s node is cheaper but cannot satisfy 8x.
-        self.assertEqual(offer["instance_type"], "a2-highgpu-8g")
+        # The free 1-GPU k8s node is cheaper but cannot satisfy 8x, so it
+        # must not win.
+        self.assertNotEqual(offer["instance_type"], "local-cluster")
+        self.assertEqual(
+            offer,
+            min((o for o in self.catalog.db
+                 if o["accelerator"] == "A100" and o["gpus"] >= 8),
+                key=lambda o: o["hourly_cost"]))
 
     def test_results_are_sorted_ascending_by_cost(self) -> None:
         costs = [o["hourly_cost"]
@@ -154,8 +162,8 @@ class TestCostCatalog(unittest.TestCase):
 
     def test_unsatisfiable_request_raises(self) -> None:
         with self.assertRaises(CatalogError) as ctx:
-            self.catalog.find_cheapest_match("H100", 1)
-        self.assertIn("H100", str(ctx.exception))
+            self.catalog.find_cheapest_match("B200", 1)
+        self.assertIn("B200", str(ctx.exception))
 
     def test_cost_projection(self) -> None:
         offer = self.catalog.find_cheapest_match("A10G", 1)
@@ -173,6 +181,127 @@ class TestCostCatalog(unittest.TestCase):
     def test_malformed_catalog_is_rejected(self) -> None:
         with self.assertRaises(CatalogError):
             CostCatalog(entries=[{"cloud": "aws"}])
+
+
+class TestVramSelection(unittest.TestCase):
+    """For LLM work the constraint is memory, not the part number."""
+
+    def setUp(self) -> None:
+        self.catalog = CostCatalog()
+
+    def test_vram_floor_selects_across_part_numbers(self) -> None:
+        offer = self.catalog.find_cheapest_match(min_vram_gb=160)
+        self.assertGreaterEqual(total_vram_gb(offer), 160)
+
+    def test_vram_floor_rejects_capacity_that_cannot_fit(self) -> None:
+        for offer in self.catalog.find_matches(min_vram_gb=320):
+            self.assertGreaterEqual(total_vram_gb(offer), 320,
+                                    offer["instance_type"])
+
+    def test_cpu_only_cannot_satisfy_a_vram_floor(self) -> None:
+        for offer in self.catalog.find_matches(min_vram_gb=1):
+            self.assertIsNotNone(offer["accelerator"])
+
+    def test_accelerator_none_without_vram_is_still_cpu_only(self) -> None:
+        """The old meaning of accelerator=None must not change."""
+        offer = self.catalog.find_cheapest_match(None, 0)
+        self.assertEqual(offer["gpus"], 0)
+
+    def test_accelerator_and_vram_are_both_applied(self) -> None:
+        offers = self.catalog.find_matches("A100", 1, min_vram_gb=640)
+        for offer in offers:
+            self.assertEqual(offer["accelerator"], "A100")
+            self.assertGreaterEqual(total_vram_gb(offer), 640)
+
+    def test_unsatisfiable_vram_floor_explains_itself(self) -> None:
+        with self.assertRaises(CatalogError) as ctx:
+            self.catalog.find_cheapest_match(min_vram_gb=100_000)
+        self.assertIn("100000 GB VRAM", str(ctx.exception))
+
+    def test_a_neocloud_undercuts_the_hyperscalers_for_h100(self) -> None:
+        """The reason the catalog spans neoclouds at all."""
+        cheapest = self.catalog.find_cheapest_match("H100", 8)
+        hyperscaler = self.catalog.find_cheapest_match("H100", 8,
+                                                       clouds=["aws", "gcp"])
+        self.assertNotIn(cheapest["cloud"], ("aws", "gcp"))
+        self.assertLess(cheapest["hourly_cost"], hyperscaler["hourly_cost"])
+
+    def test_model_size_to_vram(self) -> None:
+        # 70B at bf16: 2 bytes per param plus 20% headroom.
+        self.assertEqual(vram_for_model(70, "bf16"), 168)
+        # Quantizing cuts the floor proportionally.
+        self.assertEqual(vram_for_model(70, "int4"), 42)
+        self.assertLess(vram_for_model(7, "bf16"),
+                        vram_for_model(70, "bf16"))
+
+    def test_unknown_precision_is_rejected(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            vram_for_model(70, "fp13")
+        self.assertIn("fp13", str(ctx.exception))
+
+    def test_every_gpu_entry_declares_its_memory(self) -> None:
+        """A GPU entry without memory would silently fail every VRAM query."""
+        for entry in self.catalog.db:
+            if entry["accelerator"]:
+                self.assertGreater(entry.get("gpu_memory_gb", 0), 0,
+                                   entry["instance_type"])
+
+    def test_blueprint_min_vram_reaches_the_catalog(self) -> None:
+        task = Task.from_dict({
+            "name": "serve-70b", "run": "python serve.py",
+            "resources": {"min_vram_gb": 168}})
+        self.assertEqual(task.min_vram_gb, 168)
+        self.assertIsNone(task.accelerator)
+        # A VRAM floor implies at least one GPU.
+        self.assertEqual(task.gpu_count, 1)
+        offer = Orchestrator(catalog=self.catalog).select_offer(task)
+        self.assertGreaterEqual(total_vram_gb(offer), 168)
+
+    def test_describe_request_forms(self) -> None:
+        self.assertEqual(describe_request("A100", 8), "8x A100")
+        self.assertEqual(describe_request(None), "CPU-only")
+        self.assertEqual(describe_request(None, 1, 168),
+                         "any GPU with >=168 GB VRAM")
+
+
+class TestPriceFreshness(unittest.TestCase):
+    """Stale prices make a cost optimizer confidently wrong."""
+
+    def test_old_prices_are_reported_as_stale(self) -> None:
+        catalog = CostCatalog(entries=[{
+            "cloud": "aws", "instance_type": "old", "accelerator": "A100",
+            "gpus": 1, "gpu_memory_gb": 80, "hourly_cost": 1.0,
+            "region": "r", "price_as_of": "2020-01-01"}])
+        self.assertEqual(len(catalog.stale_entries()), 1)
+
+    def test_fresh_prices_are_not_stale(self) -> None:
+        catalog = CostCatalog(entries=[{
+            "cloud": "aws", "instance_type": "new", "accelerator": "A100",
+            "gpus": 1, "gpu_memory_gb": 80, "hourly_cost": 1.0,
+            "region": "r", "price_as_of": "2026-10-01"}])
+        self.assertEqual(
+            catalog.stale_entries(today=date(2026, 10, 23)), [])
+
+    def test_undated_prices_count_as_stale(self) -> None:
+        catalog = CostCatalog(entries=[{
+            "cloud": "aws", "instance_type": "undated", "accelerator": None,
+            "gpus": 0, "hourly_cost": 1.0, "region": "r"}])
+        self.assertEqual(len(catalog.stale_entries()), 1)
+
+    def test_malformed_date_counts_as_stale_rather_than_crashing(self) -> None:
+        catalog = CostCatalog(entries=[{
+            "cloud": "aws", "instance_type": "bad", "accelerator": None,
+            "gpus": 0, "hourly_cost": 1.0, "region": "r",
+            "price_as_of": "last tuesday"}])
+        self.assertEqual(len(catalog.stale_entries()), 1)
+
+    def test_older_snapshots_without_new_fields_still_load(self) -> None:
+        """A snapshot written before gpu_memory_gb existed must not error."""
+        catalog = CostCatalog(entries=[{
+            "cloud": "aws", "instance_type": "legacy", "accelerator": "A100",
+            "gpus": 1, "hourly_cost": 1.0, "region": "r"}])
+        self.assertEqual(catalog.db[0]["gpu_memory_gb"], 0)
+        self.assertIsNone(catalog.db[0]["price_as_of"])
 
 
 class TestTaskBlueprint(unittest.TestCase):
@@ -309,7 +438,15 @@ class TestEnvExpansion(unittest.TestCase):
         self.assertEqual(task.remote_workdir, "/opt/lightos")
         # The production host must survive the deploy job.
         self.assertFalse(task.autostop)
-        self.assertEqual(task.envs["LIGHTOS_DOMAIN"], "agentic.lightos.sh")
+        # The API must get its own hostname: deploying Caddy onto the
+        # frontend's host would claim its certificate and take it offline.
+        frontend = "agentic.lightos.sh"
+        api_host = task.envs["LIGHTOS_DOMAIN"]
+        self.assertNotEqual(api_host, frontend)
+        self.assertTrue(api_host.endswith(frontend), api_host)
+        # And the frontend must be allowed to call the API from a browser.
+        self.assertIn(f"https://{frontend}",
+                      task.envs["LIGHTOS_ALLOWED_ORIGINS"])
         self.assertEqual(os.path.realpath(task.workdir),
                          os.path.realpath(root))
 
@@ -325,6 +462,88 @@ class TestEnvExpansion(unittest.TestCase):
         self.assertEqual(offer["cloud"], "aws")
 
 
+class TestSSHKeyResolution(unittest.TestCase):
+    """A key that is not at ~/.ssh/id_rsa must still be reachable."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.key = os.path.join(self.tmp.name, "lightrailabs_ed25519")
+        with open(self.key, "w", encoding="utf-8") as fh:
+            fh.write("not-a-real-key")
+
+    def test_blueprint_key_path_wins(self) -> None:
+        from lightos.execution import RemoteJobExecutor
+
+        ex = RemoteJobExecutor(host_ip="h", ssh_key_path=self.key)
+        self.assertEqual(ex.ssh_key_path, self.key)
+
+    def test_env_var_is_used_when_blueprint_is_silent(self) -> None:
+        from lightos.execution import SSH_KEY_ENV, RemoteJobExecutor
+
+        with patch.dict(os.environ, {SSH_KEY_ENV: self.key}):
+            self.assertEqual(RemoteJobExecutor(host_ip="h").ssh_key_path,
+                             self.key)
+
+    def test_blueprint_overrides_the_env_var(self) -> None:
+        from lightos.execution import SSH_KEY_ENV, RemoteJobExecutor
+
+        with patch.dict(os.environ, {SSH_KEY_ENV: "/from/env"}):
+            ex = RemoteJobExecutor(host_ip="h", ssh_key_path=self.key)
+        self.assertEqual(ex.ssh_key_path, self.key)
+
+    def test_falls_back_to_the_conventional_path(self) -> None:
+        from lightos.execution import (DEFAULT_SSH_KEY, SSH_KEY_ENV,
+                                       RemoteJobExecutor)
+
+        env = {k: v for k, v in os.environ.items() if k != SSH_KEY_ENV}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(RemoteJobExecutor(host_ip="h").ssh_key_path,
+                             os.path.expanduser(DEFAULT_SSH_KEY))
+
+    def test_task_key_path_reaches_the_executor(self) -> None:
+        """The whole point: a blueprint field must survive to the executor."""
+        from lightos.orchestrator import default_executor_factory
+
+        task = Task.from_dict({"name": "t", "run": "echo hi",
+                               "ssh_key_path": self.key,
+                               "ssh_user": "admin",
+                               "resources": {"accelerators": "L4"}})
+        node = ProvisionedNode(instance_id="i-1", host_ip="203.0.113.10",
+                               username="ubuntu")
+        executor = default_executor_factory(node, task)
+        self.assertEqual(executor.ssh_key_path, self.key)
+        self.assertEqual(executor.username, "admin")
+
+    def test_missing_key_error_names_the_keys_that_exist(self) -> None:
+        from lightos.execution import (ExecutionError, RemoteJobExecutor,
+                                       describe_available_keys)
+
+        ex = RemoteJobExecutor(host_ip="h",
+                               ssh_key_path=os.path.join(self.tmp.name,
+                                                         "absent"),
+                               stdout=io.StringIO())
+        with self.assertRaises(ExecutionError) as ctx:
+            ex.connect()
+        message = str(ctx.exception)
+        self.assertIn("SSH key not found", message)
+        self.assertIn("LIGHTOS_SSH_KEY", message)
+        # And the helper lists real keys rather than only the missing one.
+        listing = describe_available_keys(self.tmp.name)
+        self.assertIn("lightrailabs_ed25519", listing)
+
+    def test_key_listing_hides_public_keys_and_known_hosts(self) -> None:
+        from lightos.execution import describe_available_keys
+
+        for name in ("lightrailabs_ed25519.pub", "known_hosts", "config"):
+            open(os.path.join(self.tmp.name, name), "w").close()
+        listing = describe_available_keys(self.tmp.name)
+        self.assertIn("lightrailabs_ed25519", listing)
+        self.assertNotIn(".pub", listing)
+        self.assertNotIn("known_hosts", listing)
+        self.assertNotIn("config", listing)
+
+
 class TestAPIServer(unittest.TestCase):
     """The HTTP surface behind agentic.lightos.sh."""
 
@@ -334,7 +553,7 @@ class TestAPIServer(unittest.TestCase):
         import http.client
 
         host, port = server.server_address[:2]
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
         try:
             conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
@@ -388,6 +607,43 @@ class TestAPIServer(unittest.TestCase):
         self.assertAlmostEqual(body["matches"][0]["projected_cost"], 2.012,
                                places=3)
 
+    def test_catalog_accepts_a_vram_floor(self) -> None:
+        server, _, _ = self._serve()
+        status, body = self._request(
+            server, "GET", "/v1/catalog?min_vram_gb=320")
+        self.assertEqual(status, 200)
+        self.assertGreater(body["count"], 0)
+        for match in body["matches"]:
+            self.assertGreaterEqual(match["total_vram_gb"], 320)
+
+    def test_catalog_sizes_a_model_for_the_frontend(self) -> None:
+        server, _, _ = self._serve()
+        status, body = self._request(
+            server, "GET", "/v1/catalog?model_size=70&precision=bf16")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["vram_required_gb"], 168)
+        self.assertGreaterEqual(body["query"]["min_vram_gb"], 168)
+        self.assertGreaterEqual(body["cheapest"]["total_vram_gb"], 168)
+
+    def test_catalog_reports_stale_price_count(self) -> None:
+        server, _, _ = self._serve()
+        _, body = self._request(server, "GET", "/v1/catalog?gpus=0")
+        self.assertIn("stale_prices", body)
+        self.assertIsInstance(body["stale_prices"], int)
+
+    def test_catalog_rejects_an_unknown_precision(self) -> None:
+        server, _, _ = self._serve()
+        status, body = self._request(
+            server, "GET", "/v1/catalog?model_size=70&precision=fp13")
+        self.assertEqual(status, 400)
+        self.assertIn("fp13", body["error"])
+
+    def test_catalog_rejects_non_numeric_vram(self) -> None:
+        server, _, _ = self._serve()
+        status, _ = self._request(server, "GET",
+                                  "/v1/catalog?min_vram_gb=loads")
+        self.assertEqual(status, 400)
+
     def test_catalog_rejects_non_numeric_gpus(self) -> None:
         server, _, _ = self._serve()
         status, body = self._request(server, "GET",
@@ -422,11 +678,11 @@ class TestAPIServer(unittest.TestCase):
     def test_estimate_reports_unsatisfiable_hardware(self) -> None:
         server, _, _ = self._serve()
         payload = json.dumps({"name": "t", "run": "echo hi",
-                              "resources": {"accelerators": "H100"}})
+                              "resources": {"accelerators": "B200"}})
         status, body = self._request(server, "POST", "/v1/estimate",
                                      body=payload.encode("utf-8"))
         self.assertEqual(status, 409)
-        self.assertIn("H100", body["error"])
+        self.assertIn("B200", body["error"])
 
     def test_job_submission_is_disabled_without_a_token(self) -> None:
         server, provider, _ = self._serve(api_token=None)
@@ -457,15 +713,170 @@ class TestAPIServer(unittest.TestCase):
                          'echo "Initializing dependencies..."')
 
     def test_oversized_body_is_refused(self) -> None:
+        from lightos.server import MAX_BODY_BYTES
+
         server, _, _ = self._serve()
-        huge = b"name: t\nrun: echo hi\n# " + b"x" * (300 * 1024)
+        huge = b"name: t\nrun: echo hi\n# " + b"x" * (MAX_BODY_BYTES + 1024)
         status, _ = self._request(server, "POST", "/v1/estimate", body=huge)
         self.assertEqual(status, 413)
+
+    def test_oversized_body_is_refused_repeatedly(self) -> None:
+        """Rejecting mid-upload used to reset the connection intermittently,
+        so the client saw a broken pipe instead of the 413 we sent."""
+        from lightos.server import MAX_BODY_BYTES
+
+        server, _, _ = self._serve()
+        huge = b"name: t\nrun: echo hi\n# " + b"x" * (MAX_BODY_BYTES * 2)
+        for attempt in range(6):
+            status, _ = self._request(server, "POST", "/v1/estimate",
+                                      body=huge)
+            self.assertEqual(status, 413, f"attempt {attempt}")
+
+    def test_body_at_the_limit_is_still_accepted(self) -> None:
+        """Off-by-one at the boundary would reject legitimate blueprints."""
+        from lightos.server import MAX_BODY_BYTES
+
+        server, _, _ = self._serve()
+        padding = b"\n# " + b"x" * (MAX_BODY_BYTES - len(SAMPLE_YAML) - 8)
+        body = SAMPLE_YAML.encode("utf-8") + padding
+        self.assertLessEqual(len(body), MAX_BODY_BYTES)
+        status, _ = self._request(server, "POST", "/v1/estimate", body=body)
+        self.assertEqual(status, 200)
 
     def test_unknown_route_404s(self) -> None:
         server, _, _ = self._serve()
         status, _ = self._request(server, "GET", "/v1/nope")
         self.assertEqual(status, 404)
+
+
+class TestCORS(unittest.TestCase):
+    """Without these headers a browser frontend cannot call the API at all."""
+
+    FRONTEND = "https://agentic.lightos.sh"
+
+    def _serve(self, origins):
+        import threading
+
+        from lightos.server import build_server
+
+        orchestrator = build_orchestrator(RecordingExecutor(),
+                                          MockAWSProvider())
+        server = build_server(host="127.0.0.1", port=0,
+                              catalog=orchestrator.catalog,
+                              orchestrator=orchestrator,
+                              allowed_origins=origins)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+        return server
+
+    @staticmethod
+    def _request(server, method, path, origin=None, body=None):
+        import http.client
+
+        headers = {"Origin": origin} if origin else {}
+        conn = http.client.HTTPConnection("127.0.0.1",
+                                          server.server_address[1], timeout=30)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            r = conn.getresponse()
+            r.read()
+            return r.status, dict(r.getheaders())
+        finally:
+            conn.close()
+
+    def test_allowed_origin_is_echoed(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "GET", "/v1/catalog?gpus=0",
+                                        origin=self.FRONTEND)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         self.FRONTEND)
+        self.assertEqual(headers.get("Vary"), "Origin")
+
+    def test_unlisted_origin_gets_no_cors_header(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "GET", "/healthz",
+                                        origin="https://evil.example")
+        # The request still succeeds server-side; the browser is what blocks
+        # the read, because no Allow-Origin came back.
+        self.assertEqual(status, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_no_cors_configured_means_no_cross_origin_access(self) -> None:
+        server = self._serve([])
+        _, headers = self._request(server, "GET", "/healthz",
+                                   origin=self.FRONTEND)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_wildcard_echoes_the_caller(self) -> None:
+        server = self._serve(["*"])
+        _, headers = self._request(server, "GET", "/healthz",
+                                   origin="https://anything.example")
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         "https://anything.example")
+
+    def test_preflight_is_answered_for_an_allowed_origin(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "OPTIONS", "/v1/estimate",
+                                        origin=self.FRONTEND)
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         self.FRONTEND)
+        self.assertIn("POST", headers.get("Access-Control-Allow-Methods", ""))
+        self.assertIn("Authorization",
+                      headers.get("Access-Control-Allow-Headers", ""))
+        self.assertIn("Content-Type",
+                      headers.get("Access-Control-Allow-Headers", ""))
+
+    def test_preflight_is_refused_for_an_unlisted_origin(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "OPTIONS", "/v1/estimate",
+                                        origin="https://evil.example")
+        self.assertEqual(status, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_same_origin_requests_are_unaffected(self) -> None:
+        """No Origin header at all: a curl or server-side call still works."""
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_origin_list_parsing(self) -> None:
+        from lightos.server import parse_origins
+
+        self.assertEqual(parse_origins(None), ())
+        self.assertEqual(parse_origins(""), ())
+        # Trailing slashes are normalized: an Origin header never has one.
+        self.assertEqual(
+            parse_origins("https://a.example/, https://b.example , "),
+            ("https://a.example", "https://b.example"))
+
+    def test_trailing_slash_in_config_still_matches(self) -> None:
+        from lightos.server import parse_origins
+
+        server = self._serve(parse_origins(self.FRONTEND + "/"))
+        _, headers = self._request(server, "GET", "/healthz",
+                                   origin=self.FRONTEND)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         self.FRONTEND)
+
+    def test_index_reports_configured_origins(self) -> None:
+        import http.client
+        import json as _json
+
+        server = self._serve([self.FRONTEND])
+        conn = http.client.HTTPConnection("127.0.0.1",
+                                          server.server_address[1], timeout=30)
+        try:
+            conn.request("GET", "/")
+            body = _json.loads(conn.getresponse().read())
+        finally:
+            conn.close()
+        self.assertEqual(body["allowed_origins"], [self.FRONTEND])
 
 
 class TestWorkspaceSyncFiltering(unittest.TestCase):
@@ -603,7 +1014,7 @@ class TestSkyOrchestratorIntegration(unittest.TestCase):
 
     def test_unsatisfiable_hardware_fails_before_provisioning(self) -> None:
         task = Task.from_dict(self.config)
-        task.accelerator = "H100"
+        task.accelerator = "B200"
         provider = MockAWSProvider()
         with self.assertRaises(CatalogError):
             build_orchestrator(RecordingExecutor(), provider,
@@ -729,20 +1140,44 @@ class TestCLI(unittest.TestCase):
 
         buffer = io.StringIO()
         with patch("sys.stdout", buffer):
-            code = cli_main(["catalog", "-a", "H100"])
+            code = cli_main(["catalog", "-a", "B200"])
         self.assertEqual(code, 1)
         self.assertIn("No capacity matches", buffer.getvalue())
 
     def test_validate_command_accepts_the_shipped_blueprint(self) -> None:
         from lightos.cli import main as cli_main
+        from lightos.execution import SSH_KEY_ENV
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         buffer = io.StringIO()
-        with patch("sys.stdout", buffer):
-            code = cli_main(["validate",
-                             os.path.join(root, "task_config.yaml")])
+        # Point at a key that exists so the check passes on any machine.
+        with tempfile.TemporaryDirectory() as tmp:
+            key = os.path.join(tmp, "id_test")
+            open(key, "w").close()
+            with patch.dict(os.environ, {SSH_KEY_ENV: key}), \
+                 patch("sys.stdout", buffer):
+                code = cli_main(["validate",
+                                 os.path.join(root, "task_config.yaml")])
         self.assertEqual(code, 0)
         self.assertIn("Blueprint is valid", buffer.getvalue())
+
+    def test_validate_fails_when_no_ssh_key_is_usable(self) -> None:
+        """Catch an unusable key before a node is provisioned and billed."""
+        from lightos.cli import main as cli_main
+        from lightos.execution import SSH_KEY_ENV
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = os.path.join(tmp, "not-there")
+            with patch.dict(os.environ, {SSH_KEY_ENV: absent}), \
+                 patch("sys.stdout", buffer):
+                code = cli_main(["validate",
+                                 os.path.join(root, "task_config.yaml")])
+        output = buffer.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("MISSING", output)
+        self.assertIn("launch would fail", output)
 
     def test_launch_dry_run_provisions_nothing(self) -> None:
         from lightos.cli import main as cli_main

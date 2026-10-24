@@ -68,6 +68,9 @@ class Task:
     name: str
     accelerator: Optional[str] = None
     gpu_count: int = 1
+    # Aggregate GPU memory floor. For LLM work this is the real constraint:
+    # what matters is whether the model fits, not the part number.
+    min_vram_gb: Optional[int] = None
     cloud: Optional[str] = None
     region: Optional[str] = None
     setup: str = ""
@@ -76,6 +79,9 @@ class Task:
     envs: Dict[str, Any] = field(default_factory=dict)
     remote_workdir: str = "/tmp/lightos_workdir"
     autostop: bool = True
+    # None falls back to LIGHTOS_SSH_KEY, then ~/.ssh/id_rsa.
+    ssh_key_path: Optional[str] = None
+    ssh_user: Optional[str] = None
 
     # ------------------------------------------------------------------
     @classmethod
@@ -100,8 +106,13 @@ class Task:
                 raise TaskError(
                     f"Could not read a GPU count from '{count}'.") from exc
 
+        min_vram_gb = resources.get("min_vram_gb")
+        if min_vram_gb is not None:
+            min_vram_gb = int(min_vram_gb)
+
         if gpu_count is None:
-            gpu_count = 1 if accelerator else 0
+            # A VRAM floor implies at least one GPU even with no part named.
+            gpu_count = 1 if (accelerator or min_vram_gb) else 0
 
         run = config.get("run", "")
         if not run.strip():
@@ -114,6 +125,7 @@ class Task:
             name=str(config["name"]),
             accelerator=accelerator,
             gpu_count=int(gpu_count),
+            min_vram_gb=min_vram_gb,
             cloud=clouds.lower() if isinstance(clouds, str) else None,
             region=resources.get("region"),
             setup=config.get("setup", "") or "",
@@ -123,6 +135,8 @@ class Task:
             remote_workdir=config.get("remote_workdir",
                                       "/tmp/lightos_workdir"),
             autostop=bool(config.get("autostop", True)),
+            ssh_key_path=config.get("ssh_key_path"),
+            ssh_user=config.get("ssh_user"),
         )
 
     @classmethod
@@ -157,6 +171,8 @@ class Task:
         return "\n".join(parts)
 
     def describe(self) -> str:
-        hardware = (f"{self.gpu_count}x {self.accelerator}"
-                    if self.accelerator else "CPU-only")
+        from .catalog import describe_request
+
+        hardware = describe_request(self.accelerator, self.gpu_count,
+                                    self.min_vram_gb)
         return f"{self.name} [{hardware}]"

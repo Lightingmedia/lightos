@@ -26,6 +26,12 @@ from typing import IO, Iterable, List, Optional, Sequence
 
 DEFAULT_REMOTE_WORKDIR = "/tmp/lightos_workdir"
 
+# Private key used to reach provisioned nodes. Set LIGHTOS_SSH_KEY to use a
+# key that is not at the conventional path, which is common once you have
+# more than one (ed25519 keys are rarely named id_rsa).
+SSH_KEY_ENV = "LIGHTOS_SSH_KEY"
+DEFAULT_SSH_KEY = "~/.ssh/id_rsa"
+
 # Never shipped to a remote node: caches, local virtualenvs, VCS metadata and
 # anything holding credentials.
 DEFAULT_EXCLUDES: Sequence[str] = (
@@ -40,6 +46,28 @@ DEFAULT_EXCLUDES: Sequence[str] = (
 
 class ExecutionError(RuntimeError):
     """Raised when a remote command fails or the connection cannot be made."""
+
+
+def describe_available_keys(ssh_dir: str = "~/.ssh") -> str:
+    """Name the private keys that do exist, to shortcut the usual diagnosis.
+
+    The default path is only a convention; a node is often unreachable simply
+    because the key is called something else.
+    """
+    ssh_dir = os.path.expanduser(ssh_dir)
+    try:
+        names = sorted(
+            name for name in os.listdir(ssh_dir)
+            if not name.endswith(".pub")
+            and name not in ("known_hosts", "known_hosts.old", "config",
+                             "authorized_keys")
+        )
+    except OSError:
+        return f"No readable keys in {ssh_dir}."
+    if not names:
+        return f"No private keys found in {ssh_dir}."
+    listed = ", ".join(f"~/.ssh/{name}" for name in names)
+    return f"Private keys present: {listed}."
 
 
 def _is_excluded(relative_path: str, excludes: Sequence[str]) -> bool:
@@ -80,7 +108,7 @@ class RemoteJobExecutor:
     def __init__(self,
                  host_ip: str,
                  username: str = "ubuntu",
-                 ssh_key_path: str = "~/.ssh/id_rsa",
+                 ssh_key_path: Optional[str] = None,
                  port: int = 22,
                  connect_timeout: int = 15,
                  connect_retries: int = 10,
@@ -94,7 +122,8 @@ class RemoteJobExecutor:
             else use_select
         self.host_ip = host_ip
         self.username = username
-        self.ssh_key_path = os.path.expanduser(ssh_key_path)
+        self.ssh_key_path = os.path.expanduser(
+            ssh_key_path or os.environ.get(SSH_KEY_ENV) or DEFAULT_SSH_KEY)
         self.port = port
         self.connect_timeout = connect_timeout
         self.connect_retries = connect_retries
@@ -127,7 +156,10 @@ class RemoteJobExecutor:
         self._log(f"[SSH] Connecting to {self.username}@{self.host_ip}:"
                   f"{self.port}...")
         if not os.path.exists(self.ssh_key_path):
-            raise ExecutionError(f"SSH key not found at {self.ssh_key_path}.")
+            raise ExecutionError(
+                f"SSH key not found at {self.ssh_key_path}. "
+                f"{describe_available_keys()} Set {SSH_KEY_ENV}, or add "
+                f"'ssh_key_path:' to the task blueprint.")
 
         last_error: Optional[Exception] = None
         for attempt in range(1, self.connect_retries + 1):

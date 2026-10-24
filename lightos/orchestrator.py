@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 from .backends import CloudProvider, ProvisionedNode, get_provider
-from .catalog import CostCatalog, estimate_cost
+from .catalog import CostCatalog, estimate_cost, total_vram_gb
 from .execution import (DEFAULT_REMOTE_WORKDIR, KubernetesJobExecutor,
                         RemoteJobExecutor)
 from .task import Task
@@ -60,8 +60,11 @@ class JobResult:
 def default_executor_factory(node: ProvisionedNode, task: Task):
     """Pick SSH or pod exec based on what the backend handed back."""
     if node.host_ip:
+        # The blueprint wins over the backend's default login, so a custom
+        # AMI or a key that is not at ~/.ssh/id_rsa is reachable.
         return RemoteJobExecutor(host_ip=node.host_ip,
-                                 username=node.username)
+                                 username=task.ssh_user or node.username,
+                                 ssh_key_path=task.ssh_key_path)
     return KubernetesJobExecutor(
         pod_name=node.instance_id,
         namespace=node.metadata.get("namespace", "default"),
@@ -93,10 +96,13 @@ class Orchestrator:
             accelerator=task.accelerator,
             gpu_count=task.gpu_count,
             clouds=task.clouds,
-            region=task.region)
+            region=task.region,
+            min_vram_gb=task.min_vram_gb)
+        vram = total_vram_gb(offer)
+        detail = f" {vram} GB VRAM" if vram else ""
         print(f"[Optimizer] Selected {offer['cloud'].upper()} "
-              f"{offer['instance_type']} @ {offer['region']} "
-              f"(${offer['hourly_cost']}/hr)")
+              f"{offer['instance_type']} @ {offer['region']}"
+              f"{detail} (${offer['hourly_cost']}/hr)")
         return offer
 
     def launch(self, task: Task, dry_run: bool = False) -> JobResult:

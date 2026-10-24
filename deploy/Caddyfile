@@ -1,4 +1,5 @@
-# TLS for agentic.lightos.sh. Caddy requests and renews the certificate
+# TLS for the LightOS API host (LIGHTOS_DOMAIN -- the API's own hostname,
+# not the frontend's). Caddy requests and renews the certificate
 # automatically over ACME; no key material is stored in this repo.
 {
 	email {$LIGHTOS_ACME_EMAIL}
