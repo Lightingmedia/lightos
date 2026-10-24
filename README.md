@@ -69,7 +69,7 @@ empty string on the node.
 | [`lightos/execution.py`](lightos/execution.py) | SSH/SFTP sync and live log streaming; pod-exec equivalent for K8s |
 | [`lightos/orchestrator.py`](lightos/orchestrator.py) | The pipeline that wires the above together, teardown included |
 | [`lightos/cli.py`](lightos/cli.py) | Command-line interface |
-| [`lightos/server.py`](lightos/server.py) | HTTP API (what `agentic.lightos.sh` serves) |
+| [`lightos/server.py`](lightos/server.py) | HTTP API the frontend calls |
 
 Three design points worth knowing:
 
@@ -122,6 +122,31 @@ is set, compares the token in constant time, and the bundled Caddy config
 blocks it at the edge as well. Expose it only deliberately, and generate the
 token with `python -c "from lightos.server import generate_token; print(generate_token())"`.
 
+### Calling it from a browser frontend
+
+LightOS is the backend. A frontend served from a different hostname is a
+different *origin*, and a browser blocks cross-origin reads unless the server
+opts in, so list the frontend's origin:
+
+```bash
+export LIGHTOS_ALLOWED_ORIGINS="https://agentic.lightos.sh,http://localhost:5173"
+```
+
+Comma-separated; include the scheme and no trailing slash (one is stripped if
+you add it). Unset means no cross-origin access at all — the request succeeds
+server-side but the browser discards the response, which looks like a CORS
+error in the console rather than a server failure. `GET /` reports the
+configured origins, and so does the startup log, so a frontend that cannot
+reach the API is quick to diagnose.
+
+`*` is accepted and echoes the caller's origin. Only use it while every
+exposed endpoint is read-only.
+
+**Keep the API token out of the frontend.** Anything a browser holds is
+public. The frontend should call `GET /v1/catalog` and `POST /v1/estimate`,
+which need no auth; `POST /v1/jobs` should be driven from a server you
+control, not from the page.
+
 ## Deploying to production
 
 The deploy is itself a LightOS job: [`deploy/production.yaml`](deploy/production.yaml)
@@ -129,30 +154,50 @@ provisions the cheapest CPU node, syncs this repo to `/opt/lightos`, installs
 Docker, and brings up the API behind Caddy, which obtains the TLS certificate
 over ACME. No key material is stored in the repo.
 
+This deploys the **backend only**. The frontend is a separate app that calls
+this API, so the API gets its own hostname — `api.agentic.lightos.sh` in the
+blueprint. Pointing `LIGHTOS_DOMAIN` at the frontend's hostname would make
+Caddy claim that name's certificate and take the frontend offline, so CI
+fails the build if the two are ever the same.
+
 ```bash
 # 1. Credentials and configuration
 export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
 export LIGHTOS_AWS_AMI=ami-...            # Ubuntu 22.04 in your region
-export LIGHTOS_AWS_KEY_NAME=my-keypair    # matching ~/.ssh/id_rsa
+export LIGHTOS_AWS_KEY_NAME=my-keypair    # registered in EC2
+export LIGHTOS_SSH_KEY=~/.ssh/my-keypair  # the matching private key
 export LIGHTOS_ACME_EMAIL=ops@example.com
 export LIGHTOS_API_TOKEN=$(python -c "from lightos.server import generate_token; print(generate_token())")
 
-# 2. Price it before spending anything
+# 2. Check the blueprint, including that the SSH key resolves
+python main.py validate deploy/production.yaml
+
+# 3. Price it before spending anything
 python main.py deploy/production.yaml --dry-run
 
-# 3. Deploy
+# 4. Deploy
 python main.py deploy/production.yaml
 ```
 
-Two things must be true before step 3, and neither is something the
+Three things must be true before step 4, and none is something the
 orchestrator can do for you:
 
-1. **Networking.** The node's security group must allow inbound 80 and 443
+1. **An SSH keypair that matches.** `LIGHTOS_AWS_KEY_NAME` is the keypair
+   registered in EC2; `LIGHTOS_SSH_KEY` is the private half on your machine.
+   The default is `~/.ssh/id_rsa`, which is only a convention — if your key
+   is named anything else, set `LIGHTOS_SSH_KEY` or `ssh_key_path:` in the
+   blueprint. `validate` exits non-zero and names the keys you do have when
+   this is wrong, so you find out before a node is provisioned and billed.
+2. **Networking.** The node's security group must allow inbound 80 and 443
    (ACME validation needs both) and 22 for the sync.
-2. **DNS.** `agentic.lightos.sh` must have an A record pointing at the node's
-   public address. Certificate issuance fails until it resolves. Run step 3,
-   note the address in the provisioning output, create the record, then re-run
-   — or allocate an Elastic IP first and point DNS at it ahead of time.
+3. **DNS.** The API hostname needs an A record pointing at the node's public
+   address, created wherever the zone is hosted — your registrar's panel, not
+   AWS, unless the zone is on Route 53. Certificate issuance fails until it
+   resolves. Deploy, note the address in the provisioning output, create the
+   record, then re-run — or allocate an Elastic IP first and point DNS at it
+   ahead of time. If the record sits behind a proxy that terminates TLS
+   (Cloudflare's orange cloud), set it to DNS-only for this hostname or
+   Caddy's certificate will never be the one served.
 
 `autostop` is `false` in that blueprint, so the production host outlives the
 deploy job. To update a running deployment, re-run the same command: the
@@ -165,7 +210,8 @@ If you already have a host, skip the orchestrator:
 
 ```bash
 export LIGHTOS_ACME_EMAIL=ops@example.com
-export LIGHTOS_DOMAIN=agentic.lightos.sh
+export LIGHTOS_DOMAIN=api.agentic.lightos.sh          # the API's own host
+export LIGHTOS_ALLOWED_ORIGINS=https://agentic.lightos.sh   # the frontend
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 

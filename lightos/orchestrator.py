@@ -60,8 +60,11 @@ class JobResult:
 def default_executor_factory(node: ProvisionedNode, task: Task):
     """Pick SSH or pod exec based on what the backend handed back."""
     if node.host_ip:
+        # The blueprint wins over the backend's default login, so a custom
+        # AMI or a key that is not at ~/.ssh/id_rsa is reachable.
         return RemoteJobExecutor(host_ip=node.host_ip,
-                                 username=node.username)
+                                 username=task.ssh_user or node.username,
+                                 ssh_key_path=task.ssh_key_path)
     return KubernetesJobExecutor(
         pod_name=node.instance_id,
         namespace=node.metadata.get("namespace", "default"),

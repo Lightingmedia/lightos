@@ -1,4 +1,4 @@
-# Production blueprint: LightOS deploying itself to agentic.lightos.sh.
+# Production blueprint: LightOS deploying its own API.
 #
 #   python main.py deploy/production.yaml --dry-run   # price it first
 #   python main.py deploy/production.yaml             # provision and deploy
@@ -7,12 +7,23 @@
 # Docker, and brings up the API behind Caddy, which obtains the TLS
 # certificate for the domain on first request.
 #
+# This deploys the BACKEND only. The frontend at agentic.lightos.sh is a
+# separate app that calls this API, so LIGHTOS_API_DOMAIN must be the API's
+# own hostname (api.agentic.lightos.sh below). Pointing it at the frontend
+# host would take the frontend offline.
+#
 # Prerequisites (see README "Deploying to production"):
 #   * AWS credentials + LIGHTOS_AWS_AMI + LIGHTOS_AWS_KEY_NAME
+#   * an SSH private key matching that keypair; if it is not at
+#     ~/.ssh/id_rsa, set LIGHTOS_SSH_KEY or ssh_key_path below
 #   * a security group allowing inbound 80/443 (ACME needs both) and 22
-#   * an A/AAAA record for agentic.lightos.sh pointing at the node's address
+#   * an A record for the API hostname pointing at the node's address
 #   * LIGHTOS_ACME_EMAIL exported for certificate registration
 name: lightos-production
+
+# Private key used to reach the node. Defaults to LIGHTOS_SSH_KEY, then
+# ~/.ssh/id_rsa. Uncomment if your key is named something else:
+# ssh_key_path: ~/.ssh/lightrailabs_ed25519
 
 # Sync the whole repository; the compose build needs lightos/ and deploy/.
 workdir: ..
@@ -27,7 +38,11 @@ resources:
 remote_workdir: /opt/lightos
 
 envs:
-  LIGHTOS_DOMAIN: agentic.lightos.sh
+  # The API's own hostname, NOT the frontend's.
+  LIGHTOS_DOMAIN: api.agentic.lightos.sh
+  # Browser origins allowed to call the API: the frontend. Without this a
+  # browser blocks every cross-origin request to the API.
+  LIGHTOS_ALLOWED_ORIGINS: https://agentic.lightos.sh
   # Read from the launching shell; never commit these values.
   LIGHTOS_ACME_EMAIL: ${LIGHTOS_ACME_EMAIL}
   LIGHTOS_API_TOKEN: ${LIGHTOS_API_TOKEN}

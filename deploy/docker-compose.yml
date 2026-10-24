@@ -1,4 +1,8 @@
-# Production stack for agentic.lightos.sh.
+# Production stack for the LightOS API.
+#
+# This serves the BACKEND. The frontend (agentic.lightos.sh) is a separate
+# app that calls this API, so give the API its own hostname -- pointing
+# LIGHTOS_DOMAIN at the frontend host would take the frontend offline.
 #
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
@@ -17,6 +21,8 @@ services:
       # to enable POST /v1/jobs, which runs caller-supplied shell.
       LIGHTOS_API_TOKEN: ${LIGHTOS_API_TOKEN:-}
       LIGHTOS_CATALOG: ${LIGHTOS_CATALOG:-}
+      # Browser origins allowed to call this API (the frontend).
+      LIGHTOS_ALLOWED_ORIGINS: ${LIGHTOS_ALLOWED_ORIGINS:-}
     # Not published to the host: only Caddy reaches it, over the internal net.
     expose:
       - "8080"
@@ -39,7 +45,7 @@ services:
       - caddy_data:/data      # certificates live here; keep this volume
       - caddy_config:/config
     environment:
-      LIGHTOS_DOMAIN: ${LIGHTOS_DOMAIN:-agentic.lightos.sh}
+      LIGHTOS_DOMAIN: ${LIGHTOS_DOMAIN:?set LIGHTOS_DOMAIN to the API hostname}
       LIGHTOS_ACME_EMAIL: ${LIGHTOS_ACME_EMAIL:?set LIGHTOS_ACME_EMAIL}
     depends_on:
       - lightos

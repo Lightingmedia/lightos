@@ -76,6 +76,9 @@ class Task:
     envs: Dict[str, Any] = field(default_factory=dict)
     remote_workdir: str = "/tmp/lightos_workdir"
     autostop: bool = True
+    # None falls back to LIGHTOS_SSH_KEY, then ~/.ssh/id_rsa.
+    ssh_key_path: Optional[str] = None
+    ssh_user: Optional[str] = None
 
     # ------------------------------------------------------------------
     @classmethod
@@ -123,6 +126,8 @@ class Task:
             remote_workdir=config.get("remote_workdir",
                                       "/tmp/lightos_workdir"),
             autostop=bool(config.get("autostop", True)),
+            ssh_key_path=config.get("ssh_key_path"),
+            ssh_user=config.get("ssh_user"),
         )
 
     @classmethod

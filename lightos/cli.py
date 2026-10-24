@@ -14,6 +14,8 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .catalog import CatalogError, CostCatalog, estimate_cost
+from .execution import (DEFAULT_SSH_KEY, SSH_KEY_ENV,
+                        describe_available_keys)
 from .orchestrator import Orchestrator
 from .task import Task, TaskError
 
@@ -61,8 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("blueprint", help="Path to the task YAML.")
 
     serve = sub.add_parser("serve",
-                           help="Run the HTTP API (what agentic.lightos.sh "
-                                "serves).")
+                           help="Run the HTTP API that a frontend calls.")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int,
                        default=int(os.environ.get("PORT", "8080")))
@@ -126,10 +127,31 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     print(f"Remote dir : {task.remote_workdir}")
     print(f"Autostop   : {task.autostop}")
     print(f"Env vars   : {', '.join(task.envs) or '(none)'}")
+
+    # Check the key now: otherwise the first sign of trouble is a failed
+    # connect, after a node has been provisioned and is already billing.
+    key_path = os.path.expanduser(
+        task.ssh_key_path or os.environ.get(SSH_KEY_ENV) or DEFAULT_SSH_KEY)
+    key_missing = not os.path.exists(key_path)
+    if key_missing:
+        print(f"SSH key    : MISSING at {key_path}")
+        print(f"             {describe_available_keys()}")
+        print(f"             Set {SSH_KEY_ENV} or add 'ssh_key_path:' to the "
+              f"blueprint.")
+    else:
+        print(f"SSH key    : {key_path}")
     offer = catalog.find_cheapest_match(task.accelerator, task.gpu_count,
                                         task.clouds, task.region)
     print(f"Would use  : {offer['cloud'].upper()} {offer['instance_type']} "
           f"@ {offer['region']} (${offer['hourly_cost']}/hr)")
+
+    if key_missing:
+        # The blueprint parses, but launching it would provision a node and
+        # then fail to log in -- billing you for nothing. Report that as a
+        # failure so it is caught before any spend.
+        print("\nBlueprint parses, but the launch would fail: no usable SSH "
+              "key.")
+        return 1
     print("\nBlueprint is valid.")
     return 0
 

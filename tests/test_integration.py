@@ -309,7 +309,15 @@ class TestEnvExpansion(unittest.TestCase):
         self.assertEqual(task.remote_workdir, "/opt/lightos")
         # The production host must survive the deploy job.
         self.assertFalse(task.autostop)
-        self.assertEqual(task.envs["LIGHTOS_DOMAIN"], "agentic.lightos.sh")
+        # The API must get its own hostname: deploying Caddy onto the
+        # frontend's host would claim its certificate and take it offline.
+        frontend = "agentic.lightos.sh"
+        api_host = task.envs["LIGHTOS_DOMAIN"]
+        self.assertNotEqual(api_host, frontend)
+        self.assertTrue(api_host.endswith(frontend), api_host)
+        # And the frontend must be allowed to call the API from a browser.
+        self.assertIn(f"https://{frontend}",
+                      task.envs["LIGHTOS_ALLOWED_ORIGINS"])
         self.assertEqual(os.path.realpath(task.workdir),
                          os.path.realpath(root))
 
@@ -323,6 +331,88 @@ class TestEnvExpansion(unittest.TestCase):
             task.accelerator, task.gpu_count, task.clouds, task.region)
         self.assertEqual(offer["gpus"], 0)
         self.assertEqual(offer["cloud"], "aws")
+
+
+class TestSSHKeyResolution(unittest.TestCase):
+    """A key that is not at ~/.ssh/id_rsa must still be reachable."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.key = os.path.join(self.tmp.name, "lightrailabs_ed25519")
+        with open(self.key, "w", encoding="utf-8") as fh:
+            fh.write("not-a-real-key")
+
+    def test_blueprint_key_path_wins(self) -> None:
+        from lightos.execution import RemoteJobExecutor
+
+        ex = RemoteJobExecutor(host_ip="h", ssh_key_path=self.key)
+        self.assertEqual(ex.ssh_key_path, self.key)
+
+    def test_env_var_is_used_when_blueprint_is_silent(self) -> None:
+        from lightos.execution import SSH_KEY_ENV, RemoteJobExecutor
+
+        with patch.dict(os.environ, {SSH_KEY_ENV: self.key}):
+            self.assertEqual(RemoteJobExecutor(host_ip="h").ssh_key_path,
+                             self.key)
+
+    def test_blueprint_overrides_the_env_var(self) -> None:
+        from lightos.execution import SSH_KEY_ENV, RemoteJobExecutor
+
+        with patch.dict(os.environ, {SSH_KEY_ENV: "/from/env"}):
+            ex = RemoteJobExecutor(host_ip="h", ssh_key_path=self.key)
+        self.assertEqual(ex.ssh_key_path, self.key)
+
+    def test_falls_back_to_the_conventional_path(self) -> None:
+        from lightos.execution import (DEFAULT_SSH_KEY, SSH_KEY_ENV,
+                                       RemoteJobExecutor)
+
+        env = {k: v for k, v in os.environ.items() if k != SSH_KEY_ENV}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(RemoteJobExecutor(host_ip="h").ssh_key_path,
+                             os.path.expanduser(DEFAULT_SSH_KEY))
+
+    def test_task_key_path_reaches_the_executor(self) -> None:
+        """The whole point: a blueprint field must survive to the executor."""
+        from lightos.orchestrator import default_executor_factory
+
+        task = Task.from_dict({"name": "t", "run": "echo hi",
+                               "ssh_key_path": self.key,
+                               "ssh_user": "admin",
+                               "resources": {"accelerators": "L4"}})
+        node = ProvisionedNode(instance_id="i-1", host_ip="203.0.113.10",
+                               username="ubuntu")
+        executor = default_executor_factory(node, task)
+        self.assertEqual(executor.ssh_key_path, self.key)
+        self.assertEqual(executor.username, "admin")
+
+    def test_missing_key_error_names_the_keys_that_exist(self) -> None:
+        from lightos.execution import (ExecutionError, RemoteJobExecutor,
+                                       describe_available_keys)
+
+        ex = RemoteJobExecutor(host_ip="h",
+                               ssh_key_path=os.path.join(self.tmp.name,
+                                                         "absent"),
+                               stdout=io.StringIO())
+        with self.assertRaises(ExecutionError) as ctx:
+            ex.connect()
+        message = str(ctx.exception)
+        self.assertIn("SSH key not found", message)
+        self.assertIn("LIGHTOS_SSH_KEY", message)
+        # And the helper lists real keys rather than only the missing one.
+        listing = describe_available_keys(self.tmp.name)
+        self.assertIn("lightrailabs_ed25519", listing)
+
+    def test_key_listing_hides_public_keys_and_known_hosts(self) -> None:
+        from lightos.execution import describe_available_keys
+
+        for name in ("lightrailabs_ed25519.pub", "known_hosts", "config"):
+            open(os.path.join(self.tmp.name, name), "w").close()
+        listing = describe_available_keys(self.tmp.name)
+        self.assertIn("lightrailabs_ed25519", listing)
+        self.assertNotIn(".pub", listing)
+        self.assertNotIn("known_hosts", listing)
+        self.assertNotIn("config", listing)
 
 
 class TestAPIServer(unittest.TestCase):
@@ -466,6 +556,136 @@ class TestAPIServer(unittest.TestCase):
         server, _, _ = self._serve()
         status, _ = self._request(server, "GET", "/v1/nope")
         self.assertEqual(status, 404)
+
+
+class TestCORS(unittest.TestCase):
+    """Without these headers a browser frontend cannot call the API at all."""
+
+    FRONTEND = "https://agentic.lightos.sh"
+
+    def _serve(self, origins):
+        import threading
+
+        from lightos.server import build_server
+
+        orchestrator = build_orchestrator(RecordingExecutor(),
+                                          MockAWSProvider())
+        server = build_server(host="127.0.0.1", port=0,
+                              catalog=orchestrator.catalog,
+                              orchestrator=orchestrator,
+                              allowed_origins=origins)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+        return server
+
+    @staticmethod
+    def _request(server, method, path, origin=None, body=None):
+        import http.client
+
+        headers = {"Origin": origin} if origin else {}
+        conn = http.client.HTTPConnection("127.0.0.1",
+                                          server.server_address[1], timeout=5)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            r = conn.getresponse()
+            r.read()
+            return r.status, dict(r.getheaders())
+        finally:
+            conn.close()
+
+    def test_allowed_origin_is_echoed(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "GET", "/v1/catalog?gpus=0",
+                                        origin=self.FRONTEND)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         self.FRONTEND)
+        self.assertEqual(headers.get("Vary"), "Origin")
+
+    def test_unlisted_origin_gets_no_cors_header(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "GET", "/healthz",
+                                        origin="https://evil.example")
+        # The request still succeeds server-side; the browser is what blocks
+        # the read, because no Allow-Origin came back.
+        self.assertEqual(status, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_no_cors_configured_means_no_cross_origin_access(self) -> None:
+        server = self._serve([])
+        _, headers = self._request(server, "GET", "/healthz",
+                                   origin=self.FRONTEND)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_wildcard_echoes_the_caller(self) -> None:
+        server = self._serve(["*"])
+        _, headers = self._request(server, "GET", "/healthz",
+                                   origin="https://anything.example")
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         "https://anything.example")
+
+    def test_preflight_is_answered_for_an_allowed_origin(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "OPTIONS", "/v1/estimate",
+                                        origin=self.FRONTEND)
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         self.FRONTEND)
+        self.assertIn("POST", headers.get("Access-Control-Allow-Methods", ""))
+        self.assertIn("Authorization",
+                      headers.get("Access-Control-Allow-Headers", ""))
+        self.assertIn("Content-Type",
+                      headers.get("Access-Control-Allow-Headers", ""))
+
+    def test_preflight_is_refused_for_an_unlisted_origin(self) -> None:
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "OPTIONS", "/v1/estimate",
+                                        origin="https://evil.example")
+        self.assertEqual(status, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_same_origin_requests_are_unaffected(self) -> None:
+        """No Origin header at all: a curl or server-side call still works."""
+        server = self._serve([self.FRONTEND])
+        status, headers = self._request(server, "GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_origin_list_parsing(self) -> None:
+        from lightos.server import parse_origins
+
+        self.assertEqual(parse_origins(None), ())
+        self.assertEqual(parse_origins(""), ())
+        # Trailing slashes are normalized: an Origin header never has one.
+        self.assertEqual(
+            parse_origins("https://a.example/, https://b.example , "),
+            ("https://a.example", "https://b.example"))
+
+    def test_trailing_slash_in_config_still_matches(self) -> None:
+        from lightos.server import parse_origins
+
+        server = self._serve(parse_origins(self.FRONTEND + "/"))
+        _, headers = self._request(server, "GET", "/healthz",
+                                   origin=self.FRONTEND)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"),
+                         self.FRONTEND)
+
+    def test_index_reports_configured_origins(self) -> None:
+        import http.client
+        import json as _json
+
+        server = self._serve([self.FRONTEND])
+        conn = http.client.HTTPConnection("127.0.0.1",
+                                          server.server_address[1], timeout=5)
+        try:
+            conn.request("GET", "/")
+            body = _json.loads(conn.getresponse().read())
+        finally:
+            conn.close()
+        self.assertEqual(body["allowed_origins"], [self.FRONTEND])
 
 
 class TestWorkspaceSyncFiltering(unittest.TestCase):
@@ -735,14 +955,38 @@ class TestCLI(unittest.TestCase):
 
     def test_validate_command_accepts_the_shipped_blueprint(self) -> None:
         from lightos.cli import main as cli_main
+        from lightos.execution import SSH_KEY_ENV
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         buffer = io.StringIO()
-        with patch("sys.stdout", buffer):
-            code = cli_main(["validate",
-                             os.path.join(root, "task_config.yaml")])
+        # Point at a key that exists so the check passes on any machine.
+        with tempfile.TemporaryDirectory() as tmp:
+            key = os.path.join(tmp, "id_test")
+            open(key, "w").close()
+            with patch.dict(os.environ, {SSH_KEY_ENV: key}), \
+                 patch("sys.stdout", buffer):
+                code = cli_main(["validate",
+                                 os.path.join(root, "task_config.yaml")])
         self.assertEqual(code, 0)
         self.assertIn("Blueprint is valid", buffer.getvalue())
+
+    def test_validate_fails_when_no_ssh_key_is_usable(self) -> None:
+        """Catch an unusable key before a node is provisioned and billed."""
+        from lightos.cli import main as cli_main
+        from lightos.execution import SSH_KEY_ENV
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = os.path.join(tmp, "not-there")
+            with patch.dict(os.environ, {SSH_KEY_ENV: absent}), \
+                 patch("sys.stdout", buffer):
+                code = cli_main(["validate",
+                                 os.path.join(root, "task_config.yaml")])
+        output = buffer.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("MISSING", output)
+        self.assertIn("launch would fail", output)
 
     def test_launch_dry_run_provisions_nothing(self) -> None:
         from lightos.cli import main as cli_main
