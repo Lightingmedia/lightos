@@ -13,7 +13,8 @@ import sys
 from typing import Optional, Sequence
 
 from . import __version__
-from .catalog import CatalogError, CostCatalog, estimate_cost
+from .catalog import (CatalogError, CostCatalog, describe_request,
+                      estimate_cost, total_vram_gb, vram_for_model)
 from .execution import (DEFAULT_SSH_KEY, SSH_KEY_ENV,
                         describe_available_keys)
 from .orchestrator import Orchestrator
@@ -56,6 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
     catalog.add_argument("--region", help="Limit to one region.")
     catalog.add_argument("--hours", type=float, default=1.0,
                          help="Project the cost over this many hours.")
+    catalog.add_argument("--min-vram", type=int, dest="min_vram",
+                         help="Minimum aggregate GPU memory in GB. Omit the "
+                              "accelerator to shop across part numbers.")
+    catalog.add_argument("--model-size", type=float, dest="model_size",
+                         help="Dense model size in billions of parameters; "
+                              "sets --min-vram from it.")
+    catalog.add_argument("--precision", default="bf16",
+                         help="Precision for --model-size (bf16, fp16, fp8, "
+                              "int8, int4, fp32). Default bf16.")
 
     validate = sub.add_parser("validate",
                               help="Parse a blueprint and report what it asks "
@@ -91,29 +101,62 @@ def _cmd_launch(args: argparse.Namespace) -> int:
     return 0 if result.succeeded else (result.exit_code or 1)
 
 
+def _resolve_min_vram(args: argparse.Namespace) -> Optional[int]:
+    """Turn --model-size into a VRAM floor, keeping whichever is larger."""
+    if getattr(args, "model_size", None):
+        need = vram_for_model(args.model_size, args.precision)
+        print(f"{args.model_size}B at {args.precision} needs about {need} GB "
+              f"of VRAM (weights plus headroom).")
+        if getattr(args, "min_vram", None):
+            return max(need, args.min_vram)
+        return need
+    return getattr(args, "min_vram", None)
+
+
+def _warn_if_stale(catalog: CostCatalog) -> None:
+    stale = catalog.stale_entries()
+    if stale:
+        print(f"warning: {len(stale)} of {len(catalog)} prices are over 90 "
+              f"days old or undated; refresh before trusting a ranking.",
+              file=sys.stderr)
+
+
 def _cmd_catalog(args: argparse.Namespace) -> int:
     catalog = CostCatalog(catalog_path=args.catalog)
+    min_vram = _resolve_min_vram(args)
     options = catalog.find_matches(args.accelerator, args.gpus,
-                                   clouds=args.clouds, region=args.region)
+                                   clouds=args.clouds, region=args.region,
+                                   min_vram_gb=min_vram)
     if not options:
-        target = (f"{args.gpus}x {args.accelerator}" if args.accelerator
-                  else "CPU-only")
+        target = describe_request(args.accelerator, args.gpus, min_vram)
         print(f"No capacity matches {target}.")
         print(f"Known accelerators: {', '.join(catalog.accelerators())}")
+        print(f"Known clouds: {', '.join(catalog.clouds())}")
         return 1
 
-    header = f"{'CLOUD':<6} {'INSTANCE_TYPE':<18} {'ACCEL':<7} {'GPUS':>4} " \
-             f"{'REGION':<12} {'$/HR':>9} {'$/' + str(args.hours) + 'HR':>11}"
+    header = (f"{'CLOUD':<8} {'INSTANCE_TYPE':<22} {'ACCEL':<6} {'GPUS':>4} "
+              f"{'VRAM':>6} {'REGION':<12} {'$/HR':>9} "
+              f"{'$/' + str(args.hours) + 'HR':>11}")
     print(header)
     print("-" * len(header))
     for option in options:
-        print(f"{option['cloud']:<6} {option['instance_type']:<18} "
-              f"{str(option['accelerator'] or '-'):<7} {option['gpus']:>4} "
+        vram = total_vram_gb(option)
+        print(f"{option['cloud']:<8} {option['instance_type']:<22} "
+              f"{str(option['accelerator'] or '-'):<6} {option['gpus']:>4} "
+              f"{(str(vram) + 'G') if vram else '-':>6} "
               f"{option['region']:<12} {option['hourly_cost']:>9.4f} "
               f"{estimate_cost(option, args.hours):>11.4f}")
-    cheapest = options[0]
+
+    cheapest, dearest = options[0], options[-1]
     print(f"\nCheapest: {cheapest['cloud'].upper()} "
           f"{cheapest['instance_type']} @ ${cheapest['hourly_cost']}/hr")
+    # The spread is the point: same silicon, very different prices.
+    if cheapest["hourly_cost"] > 0 and dearest is not cheapest:
+        factor = dearest["hourly_cost"] / cheapest["hourly_cost"]
+        print(f"Dearest match is {factor:.1f}x that: "
+              f"{dearest['cloud'].upper()} {dearest['instance_type']} "
+              f"@ ${dearest['hourly_cost']}/hr")
+    _warn_if_stale(catalog)
     return 0
 
 
@@ -121,8 +164,9 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     task = Task.from_yaml(args.blueprint)
     catalog = CostCatalog(catalog_path=args.catalog)
     print(f"Task       : {task.name}")
-    print(f"Hardware   : {task.gpu_count}x {task.accelerator}"
-          if task.accelerator else "Hardware   : CPU-only")
+    print("Hardware   : "
+          + describe_request(task.accelerator, task.gpu_count,
+                             task.min_vram_gb))
     print(f"Workdir    : {task.workdir}")
     print(f"Remote dir : {task.remote_workdir}")
     print(f"Autostop   : {task.autostop}")
@@ -141,7 +185,8 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     else:
         print(f"SSH key    : {key_path}")
     offer = catalog.find_cheapest_match(task.accelerator, task.gpu_count,
-                                        task.clouds, task.region)
+                                        task.clouds, task.region,
+                                        task.min_vram_gb)
     print(f"Would use  : {offer['cloud'].upper()} {offer['instance_type']} "
           f"@ {offer['region']} (${offer['hourly_cost']}/hr)")
 

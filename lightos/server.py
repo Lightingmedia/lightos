@@ -28,12 +28,20 @@ from urllib.parse import parse_qs, urlparse
 import yaml
 
 from . import __version__
-from .catalog import CatalogError, CostCatalog, estimate_cost
+from .catalog import (CatalogError, CostCatalog, describe_request,
+                      estimate_cost, total_vram_gb, vram_for_model)
 from .orchestrator import Orchestrator
 from .task import Task, TaskError
 
 TOKEN_ENV = "LIGHTOS_API_TOKEN"
 MAX_BODY_BYTES = 256 * 1024
+
+# When rejecting an oversized body we first read and discard it, so the
+# client can finish writing and then read our 413. Replying mid-upload makes
+# the client see a connection reset instead of the status we sent. Bounded,
+# because a caller can declare a Content-Length far larger than it will send.
+MAX_DRAIN_BYTES = 4 * MAX_BODY_BYTES
+_DRAIN_CHUNK = 64 * 1024
 
 # Browser origins allowed to call this API, comma-separated, e.g.
 # "https://agentic.lightos.sh,http://localhost:5173". A browser blocks
@@ -135,28 +143,57 @@ class LightOSHandler(BaseHTTPRequestHandler):
     def _handle_catalog(self) -> None:
         params = parse_qs(urlparse(self.path).query)
         accelerator = _first(params, "accelerator")
+        precision = _first(params, "precision") or "bf16"
         try:
             gpus = int(_first(params, "gpus") or 1)
             hours = float(_first(params, "hours") or 1.0)
+            min_vram = _first(params, "min_vram_gb")
+            min_vram = int(min_vram) if min_vram else None
+            model_size = _first(params, "model_size")
+            model_size = float(model_size) if model_size else None
         except ValueError:
             self._error(HTTPStatus.BAD_REQUEST,
-                        "'gpus' and 'hours' must be numbers.")
+                        "'gpus', 'hours', 'min_vram_gb' and 'model_size' "
+                        "must be numbers.")
             return
+
+        # model_size is a convenience for frontends: it converts a parameter
+        # count into the VRAM floor that actually drives selection.
+        vram_from_model = None
+        if model_size:
+            try:
+                vram_from_model = vram_for_model(model_size, precision)
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            min_vram = max(min_vram or 0, vram_from_model)
 
         matches = self.catalog.find_matches(
             accelerator, gpus,
             clouds=params.get("cloud"),
-            region=_first(params, "region"))
+            region=_first(params, "region"),
+            min_vram_gb=min_vram)
+        enriched = [dict(m, total_vram_gb=total_vram_gb(m),
+                         projected_cost=estimate_cost(m, hours),
+                         projected_hours=hours) for m in matches]
         self._json(HTTPStatus.OK, {
             "query": {"accelerator": accelerator, "gpus": gpus,
                       "cloud": params.get("cloud"),
-                      "region": _first(params, "region")},
+                      "region": _first(params, "region"),
+                      "min_vram_gb": min_vram,
+                      "model_size": model_size,
+                      "precision": precision if model_size else None,
+                      "described": describe_request(accelerator, gpus,
+                                                    min_vram)},
+            "vram_required_gb": vram_from_model,
             "count": len(matches),
-            "matches": [
-                dict(m, projected_cost=estimate_cost(m, hours),
-                     projected_hours=hours) for m in matches
-            ],
-            "cheapest": matches[0] if matches else None,
+            "matches": enriched,
+            # The same enriched shape as the list, so a frontend can render
+            # either without special-casing the fields.
+            "cheapest": enriched[0] if enriched else None,
+            # Surfaced so a frontend can show a staleness banner rather than
+            # presenting old prices as current.
+            "stale_prices": len(self.catalog.stale_entries()),
         })
 
     def _handle_estimate(self) -> None:
@@ -239,10 +276,22 @@ class LightOSHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "Request body is required.")
             return None
         if length > MAX_BODY_BYTES:
+            self._drain(min(length, MAX_DRAIN_BYTES))
+            # Past the drain cap the request body is still arriving, so the
+            # connection cannot be reused whatever we reply.
+            self.close_connection = True
             self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                         f"Body exceeds {MAX_BODY_BYTES} bytes.")
             return None
         return self.rfile.read(length)
+
+    def _drain(self, remaining: int) -> None:
+        """Read and discard up to `remaining` bytes of the request body."""
+        while remaining > 0:
+            chunk = self.rfile.read(min(_DRAIN_CHUNK, remaining))
+            if not chunk:
+                return
+            remaining -= len(chunk)
 
     def _read_task(self) -> Optional[Task]:
         """Parse a blueprint from a JSON or YAML request body."""

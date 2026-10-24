@@ -1,9 +1,15 @@
 # LightOS
 
-A cost-optimized multi-cloud job orchestrator. You describe the hardware you
-need in YAML; LightOS finds the cheapest cluster that satisfies it across AWS,
-GCP and Kubernetes, provisions it, syncs your code, streams the logs back, and
-tears the cluster down when the job exits.
+A cost-optimized multi-cloud orchestrator for AI workloads. You describe the
+hardware a job needs — an accelerator, or just how much GPU memory the model
+requires — and LightOS finds the cheapest capacity that satisfies it across
+hyperscalers (AWS, GCP), neoclouds (RunPod, Lambda) and your own Kubernetes,
+provisions it, syncs your code, streams the logs back, and tears the cluster
+down when the job exits.
+
+Neoclouds are in there because they routinely run several times cheaper for
+the same silicon: eight H100s cost $21.52/hr on RunPod against $98.32/hr on
+AWS p5 in the bundled snapshot. Finding that gap is the entire job.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -36,6 +42,60 @@ python main.py                           # run task_config.yaml for real
 `python main.py` with no arguments launches `task_config.yaml`. Everything
 else is a subcommand: `launch`, `catalog`, `validate`, `serve`.
 
+## Sizing an LLM workload
+
+For AI workloads the binding constraint is usually GPU memory, not the part
+number — what decides whether a model runs is aggregate VRAM. Ask for that
+directly and the catalog shops across accelerators and clouds:
+
+```bash
+python main.py catalog --model-size 70 --hours 24    # a 70B dense model
+python main.py catalog --min-vram 168                # or state GB yourself
+python main.py catalog --model-size 70 --precision int4
+```
+
+```
+70.0B at bf16 needs about 168 GB of VRAM (weights plus headroom).
+CLOUD    INSTANCE_TYPE          ACCEL  GPUS   VRAM REGION            $/HR    $/24.0HR
+runpod   H100-SXM-80G-8x        H100      8   640G community      21.5200    516.4800
+lambda   gpu_8x_a100_80gb_sxm   A100      8   640G us-west-1      22.3200    535.6800
+aws      p5.48xlarge            H100      8   640G us-east-1      98.3200   2359.6800
+
+Cheapest: RUNPOD H100-SXM-80G-8x @ $21.52/hr
+Dearest match is 4.6x that: AWS p5.48xlarge @ $98.32/hr
+```
+
+That 4.6x spread for the same eight H100s is why the catalog spans
+**neoclouds** (RunPod, Lambda) alongside the hyperscalers, and why
+`--model-size` is more useful than naming a GPU: you rarely care which part
+runs the model, only that it fits and what it costs.
+
+`--model-size` is a planning aid, not a guarantee. It assumes a dense model
+and applies 20% headroom over the weights for KV cache and activations; real
+usage moves with batch size, context length and serving engine. In a
+blueprint:
+
+```yaml
+resources:
+  min_vram_gb: 168     # instead of naming an accelerator
+```
+
+### Prices go stale
+
+The bundled catalog is a dated snapshot of third-party published figures, not
+quotes, and provider tiers differ (RunPod Community vs Secure, spot vs
+on-demand, committed-use discounts). Entries carry `price_as_of`, and the CLI
+warns when they are over 90 days old:
+
+```
+warning: 8 of 20 prices are over 90 days old or undated; refresh before
+trusting a ranking.
+```
+
+Treat that warning seriously: a cost optimizer fed stale prices does not fail
+loudly, it quietly ranks the clouds wrongly. Point `LIGHTOS_CATALOG` at a
+refreshed JSON snapshot for real decisions.
+
 ## Blueprints
 
 ```yaml
@@ -63,7 +123,7 @@ empty string on the node.
 
 | Module | Responsibility |
 | --- | --- |
-| [`lightos/catalog.py`](lightos/catalog.py) | Price database and the matchmaker that picks the cheapest satisfying offer |
+| [`lightos/catalog.py`](lightos/catalog.py) | Price database and the matchmaker: picks the cheapest offer satisfying an accelerator or a VRAM floor |
 | [`lightos/task.py`](lightos/task.py) | Blueprint parsing, validation and env resolution |
 | [`lightos/backends/`](lightos/backends/base.py) | `CloudProvider` interface plus AWS, GCP and Kubernetes drivers |
 | [`lightos/execution.py`](lightos/execution.py) | SSH/SFTP sync and live log streaming; pod-exec equivalent for K8s |

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 from .backends import CloudProvider, ProvisionedNode, get_provider
-from .catalog import CostCatalog, estimate_cost
+from .catalog import CostCatalog, estimate_cost, total_vram_gb
 from .execution import (DEFAULT_REMOTE_WORKDIR, KubernetesJobExecutor,
                         RemoteJobExecutor)
 from .task import Task
@@ -96,10 +96,13 @@ class Orchestrator:
             accelerator=task.accelerator,
             gpu_count=task.gpu_count,
             clouds=task.clouds,
-            region=task.region)
+            region=task.region,
+            min_vram_gb=task.min_vram_gb)
+        vram = total_vram_gb(offer)
+        detail = f" {vram} GB VRAM" if vram else ""
         print(f"[Optimizer] Selected {offer['cloud'].upper()} "
-              f"{offer['instance_type']} @ {offer['region']} "
-              f"(${offer['hourly_cost']}/hr)")
+              f"{offer['instance_type']} @ {offer['region']}"
+              f"{detail} (${offer['hourly_cost']}/hr)")
         return offer
 
     def launch(self, task: Task, dry_run: bool = False) -> JobResult:
